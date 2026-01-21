@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LIDAR - Stała Skala 200m</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #202020; font-family: monospace; color: white; }
+        
+        #ui {
+            position: absolute; top: 10px; left: 10px; z-index: 100;
+            background: rgba(0, 0, 0, 0.9); padding: 15px; border-radius: 8px;
+            width: 300px; border: 1px solid #555; box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+
+        .nav-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; margin: 10px 0; }
+
+        button {
+            padding: 10px; cursor: pointer; background: #333; color: white; 
+            border: 1px solid #555; font-weight: bold; font-family: monospace;
+            transition: all 0.2s;
+        }
+        button:hover { background: #555; border-color: #fff; transform: scale(1.05); }
+        button:disabled { background: #1a1a1a; color: #333; cursor: default; transform: none; }
+
+        #current-tile { font-size: 1.1em; color: #00ff00; text-align: center; margin-bottom: 5px; font-weight: bold;}
+        
+        .debug-panel { 
+            background: #111; padding: 8px; margin-bottom: 10px; border: 1px solid #333; 
+            font-size: 0.9em; color: #ccc;
+        }
+        .debug-value { color: #fff; font-weight: bold; float: right; }
+        
+        #status { font-size: 0.8em; color: #aaa; margin-top: 5px; border-top: 1px solid #444; padding-top: 5px;}
+    </style>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "geotiff": "https://cdn.jsdelivr.net/npm/geotiff@2.1.1/+esm"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <div id="current-tile">Start...</div>
+        
+        <div class="debug-panel">
+            <div>Siatka: <span id="debug-grid" class="debug-value">--</span></div>
+            <div>Max Wysokość: <span id="debug-max" class="debug-value" style="color:red">--</span></div>
+        </div>
+        
+        <div class="nav-grid">
+            <div></div> <button id="btnN" onclick="move(0, 1)" disabled>▲ N</button> <div></div>
+            <button id="btnW" onclick="move(-1, 0)" disabled>◀ W</button>
+            <button onclick="resetCamera()">◉</button>
+            <button id="btnE" onclick="move(1, 0)" disabled>E ▶</button>
+            <div></div> <button id="btnS" onclick="move(0, -1)" disabled>▼ S</button> <div></div>
+        </div>
+
+        <div id="status">Inicjalizacja...</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { fromUrl } from 'geotiff';
+
+        // --- KONFIGURACJA ---
+        const TILE_FOLDER = './tiles/'; 
+        const PREFIX = "TR";
+        const SUFFIX = "_DTM_1m"; 
+
+        // Start (TR 34 dla Dover)
+        let state = { gX: 2, gY: 6, sX: 0, sY: 1 };
+
+        // --- PARAMETRY ---
+        const COLOR_MAX_HEIGHT = 150; 
+        const HEIGHT_MULTIPLIER = 5.0; 
+        const MAP_SIZE = 6000;          
+        
+        // --- USTAWIENIA POZIOMIC ---
+        const CONTOUR_INTERVAL = 50;  
+        const CONTOUR_OFFSET = 1.0;   
+
+        // CZYSTOŚĆ ETYKIET NA MAPIE
+        const LABEL_FREQUENCY = 800; 
+
+        let scene, camera, renderer, controls, terrainMesh;
+        let contoursGroup = null;
+        let axisGroup = null; 
+
+        window.move = moveTile;
+        window.resetCamera = centerCamera;
+
+        init();
+        updateWorld();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x111111); 
+            
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100000);
+            camera.position.set(0, 4000, 4000); 
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(2000, 5000, 2000);
+            scene.add(dirLight);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+            window.addEventListener('resize', onWindowResize, false);
+            animate();
+        }
+
+        async function updateWorld() {
+            disableInterface(true);
+            updateStatus("Skanowanie...", true);
+
+            const currentName = getFilename(state.gX, state.gY, state.sX, state.sY);
+            document.getElementById('current-tile').innerText = currentName;
+            
+            const quad = `${state.sY?'N':'S'}${state.sX?'E':'W'}`;
+            document.getElementById('debug-grid').innerText = `TR ${state.gX}${state.gY} ${quad}`;
+
+            const [existsN, existsS, existsE, existsW] = await Promise.all([
+                checkNeighborExists(0, 1), checkNeighborExists(0, -1),
+                checkNeighborExists(1, 0), checkNeighborExists(-1, 0)
+            ]);
+
+            document.getElementById('btnN').disabled = !existsN;
+            document.getElementById('btnS').disabled = !existsS;
+            document.getElementById('btnE').disabled = !existsE;
+            document.getElementById('btnW').disabled = !existsW;
+
+            await loadMainTile(currentName);
+            disableInterface(false);
+            
+            document.getElementById('btnN').disabled = !existsN;
+            document.getElementById('btnS').disabled = !existsS;
+            document.getElementById('btnE').disabled = !existsE;
+            document.getElementById('btnW').disabled = !existsW;
+        }
+
+        async function loadMainTile(filename) {
+            const url = `${TILE_FOLDER}${filename}.tif`;
+            updateStatus(`Pobieranie: ${filename}...`);
+            document.getElementById('debug-max').innerText = "--";
+
+            try {
+                const tiff = await fromUrl(url);
+                const image = await tiff.getImage();
+                const rasters = await image.readRasters();
+                processTerrain(rasters[0], image.getWidth(), image.getHeight());
+                updateStatus("Gotowe.");
+            } catch (error) {
+                console.error(error);
+                updateStatus(`BRAK PLIKU`, true);
+                if(terrainMesh) { scene.remove(terrainMesh); terrainMesh = null; }
+                if(contoursGroup) { scene.remove(contoursGroup); contoursGroup = null; }
+                if(axisGroup) { scene.remove(axisGroup); axisGroup = null; }
+            }
+        }
+
+        function processTerrain(data, width, height) {
+            if (terrainMesh) { scene.remove(terrainMesh); terrainMesh.geometry.dispose(); terrainMesh.material.dispose(); }
+
+            // 1. Max wysokość
+            let trueMax = -Infinity;
+            for(let i=0; i<data.length; i+=2) {
+                const val = data[i];
+                if(val > -50 && val < 5000) { if(val > trueMax) trueMax = val; }
+            }
+            if (trueMax === -Infinity) trueMax = 0;
+            document.getElementById('debug-max').innerText = trueMax.toFixed(1) + " m";
+
+            // 2. Siatka 3D
+            const maxDim = 1024;
+            const skip = Math.ceil(Math.max(width, height) / maxDim);
+            const newW = Math.floor(width / skip);
+            const newH = Math.floor(height / skip);
+            
+            const geometry = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE, newW - 1, newH - 1);
+            const vertices = geometry.attributes.position.array;
+            const colors = new Float32Array(vertices.length);
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const tempColor = new THREE.Color();
+            const cLow = new THREE.Color(0x006400);   
+            const cMid = new THREE.Color(0xffff00);   
+            const cHigh = new THREE.Color(0x8b4513);  
+
+            const gridHeights = []; 
+
+            for (let y = 0; y < newH; y++) {
+                const row = [];
+                for (let x = 0; x < newW; x++) {
+                    const originalIndex = (y * skip) * width + (x * skip);
+                    let val = data[originalIndex];
+                    if (val < -100 || val > 5000) val = 0;
+                    
+                    row.push(val);
+
+                    const vIdx = (y * newW + x) * 3;
+                    let visualHeight = (val > 0 ? val : 0); 
+                    vertices[vIdx + 2] = visualHeight * HEIGHT_MULTIPLIER;
+
+                    let norm = visualHeight / COLOR_MAX_HEIGHT;
+                    norm = Math.max(0, Math.min(1, norm));
+
+                    if (norm < 0.5) tempColor.lerpColors(cLow, cMid, norm * 2);
+                    else tempColor.lerpColors(cMid, cHigh, (norm - 0.5) * 2);
+
+                    colors[vIdx] = tempColor.r; colors[vIdx+1] = tempColor.g; colors[vIdx+2] = tempColor.b;
+                }
+                gridHeights.push(row);
+            }
+
+            geometry.computeVertexNormals();
+            
+            const mat = new THREE.MeshStandardMaterial({ 
+                vertexColors: true, side: THREE.DoubleSide, roughness: 0.8, metalness: 0.1 
+            });
+
+            terrainMesh = new THREE.Mesh(geometry, mat);
+            terrainMesh.rotation.x = -Math.PI / 2;
+            scene.add(terrainMesh);
+
+            createMarchingSquaresContours(gridHeights, newW, newH, trueMax);
+            createRulers(trueMax);
+        }
+
+        // --- LINIJKI W ROGACH ---
+        function createRulers(maxRealH) {
+            if (axisGroup) { scene.remove(axisGroup); }
+            axisGroup = new THREE.Group();
+
+            const halfSize = MAP_SIZE / 2;
+            
+            // --- ZMIANA: WYMUSZAMY MINIMUM 200 METRÓW ---
+            // Najpierw obliczamy ile by wychodziło z terenu (zaokrąglone do 50)
+            let calculatedLimit = Math.ceil(maxRealH / CONTOUR_INTERVAL) * CONTOUR_INTERVAL;
+            
+            // Potem wymuszamy, że jeśli calculatedLimit jest mniejsze niż 200, to bierzemy 200.
+            // Jeśli teren ma 300m, to weźmie 300m.
+            let rulerLimit = Math.max(calculatedLimit, 200);
+
+            const corners = [
+                { x: -halfSize, z: -halfSize }, { x: halfSize, z: -halfSize },  
+                { x: -halfSize, z: halfSize }, { x: halfSize, z: halfSize }    
+            ];
+
+            const poleMaterial = new THREE.LineBasicMaterial({ color: 0x666666 });
+            const tickMaterial = new THREE.LineBasicMaterial({ color: 0x00ffff, opacity: 0.8, transparent: true }); 
+            const tickLength = 250; 
+
+            corners.forEach(corner => {
+                const maxYCoord = rulerLimit * HEIGHT_MULTIPLIER + CONTOUR_OFFSET;
+                const points = [];
+                points.push(new THREE.Vector3(corner.x, -50, corner.z));
+                points.push(new THREE.Vector3(corner.x, maxYCoord, corner.z));
+                const poleGeo = new THREE.BufferGeometry().setFromPoints(points);
+                axisGroup.add(new THREE.Line(poleGeo, poleMaterial));
+
+                // Rysujemy podziałkę aż do rulerLimit (czyli min. 200m)
+                for (let h = CONTOUR_INTERVAL; h <= rulerLimit; h += CONTOUR_INTERVAL) {
+                    const worldY = h * HEIGHT_MULTIPLIER + CONTOUR_OFFSET;
+                    
+                    const tickPoints = [];
+                    tickPoints.push(new THREE.Vector3(corner.x - (tickLength/2), worldY, corner.z));
+                    tickPoints.push(new THREE.Vector3(corner.x + (tickLength/2), worldY, corner.z));
+                    const tickGeo = new THREE.BufferGeometry().setFromPoints(tickPoints);
+                    axisGroup.add(new THREE.Line(tickGeo, tickMaterial));
+
+                    const sprite = createTextSprite(`${h}m`);
+                    sprite.position.set(corner.x, worldY, corner.z);
+                    const textOffset = 350;
+                    sprite.position.x += (corner.x > 0 ? textOffset : -textOffset);
+                    sprite.position.z += (corner.z > 0 ? textOffset : -textOffset);
+                    axisGroup.add(sprite);
+                }
+            });
+            scene.add(axisGroup);
+        }
+
+        // --- MARCHING SQUARES ---
+        function createMarchingSquaresContours(grid, w, h, maxH) {
+            if (contoursGroup) { scene.remove(contoursGroup); }
+            contoursGroup = new THREE.Group();
+
+            const segmentStepX = MAP_SIZE / (w - 1);
+            const segmentStepY = MAP_SIZE / (h - 1);
+            const halfSize = MAP_SIZE / 2;
+
+            for (let level = CONTOUR_INTERVAL; level <= maxH; level += CONTOUR_INTERVAL) {
+                const vertices = [];
+                let segmentsSinceLabel = LABEL_FREQUENCY; 
+
+                for (let y = 0; y < h - 1; y++) {
+                    for (let x = 0; x < w - 1; x++) {
+                        const hTL = grid[y][x]; const hTR = grid[y][x+1]; const hBR = grid[y+1][x+1]; const hBL = grid[y+1][x];     
+                        let index = 0;
+                        if (hTL >= level) index |= 8; if (hTR >= level) index |= 4; if (hBR >= level) index |= 2; if (hBL >= level) index |= 1;
+                        if (index === 0 || index === 15) continue;
+
+                        const getX = (val1, val2) => (level - val1) / (val2 - val1);
+                        const muT = getX(hTL, hTR); const muR = getX(hTR, hBR); const muB = getX(hBL, hBR); const muL = getX(hTL, hBL);
+                        const pTop    = new THREE.Vector3(-halfSize + (x + muT) * segmentStepX, 0, -halfSize + y * segmentStepY);
+                        const pRight  = new THREE.Vector3(-halfSize + (x + 1) * segmentStepX, 0, -halfSize + (y + muR) * segmentStepY);
+                        const pBottom = new THREE.Vector3(-halfSize + (x + muB) * segmentStepX, 0, -halfSize + (y + 1) * segmentStepY);
+                        const pLeft   = new THREE.Vector3(-halfSize + x * segmentStepX,       0, -halfSize + (y + muL) * segmentStepY);
+
+                        const addSeg = (p1, p2) => {
+                            vertices.push(p1.clone(), p2.clone());
+                            segmentsSinceLabel++;
+                            if (segmentsSinceLabel > LABEL_FREQUENCY) {
+                                if (x > 10 && x < w - 10 && y > 10 && y < h - 10) {
+                                    const worldY = level * HEIGHT_MULTIPLIER + CONTOUR_OFFSET;
+                                    const sprite = createTextSprite(`${level}m`);
+                                    sprite.position.copy(p1).lerp(p2, 0.5);
+                                    sprite.position.y = worldY + 30; 
+                                    contoursGroup.add(sprite);
+                                    segmentsSinceLabel = 0; 
+                                }
+                            }
+                        };
+
+                        switch (index) {
+                            case 1:  addSeg(pLeft, pBottom); break; case 2:  addSeg(pBottom, pRight); break; 
+                            case 3:  addSeg(pLeft, pRight); break;  case 4:  addSeg(pTop, pRight); break;   
+                            case 5:  addSeg(pLeft, pTop); addSeg(pBottom, pRight); break; case 6:  addSeg(pTop, pBottom); break;  
+                            case 7:  addSeg(pLeft, pTop); break;    case 8:  addSeg(pLeft, pTop); break;    
+                            case 9:  addSeg(pTop, pBottom); break;  case 10: addSeg(pLeft, pBottom); addSeg(pTop, pRight); break; 
+                            case 11: addSeg(pTop, pRight); break;   case 12: addSeg(pLeft, pRight); break;  
+                            case 13: addSeg(pBottom, pRight); break; case 14: addSeg(pLeft, pBottom); break; 
+                        }
+                    }
+                }
+
+                if (vertices.length > 0) {
+                    const geometry = new THREE.BufferGeometry().setFromPoints(vertices);
+                    const worldY = level * HEIGHT_MULTIPLIER + CONTOUR_OFFSET;
+                    geometry.translate(0, worldY, 0);
+                    const material = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2 });
+                    const lines = new THREE.LineSegments(geometry, material);
+                    contoursGroup.add(lines);
+                }
+            }
+            scene.add(contoursGroup);
+        }
+
+        function createTextSprite(message) {
+            const fontface = "Arial";
+            const fontsize = 60; 
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 128;
+            const context = canvas.getContext('2d');
+            
+            context.fillStyle = "rgba(0,0,0,0.0)"; 
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            context.shadowColor = "black";
+            context.shadowBlur = 6;
+            context.lineWidth = 4;
+
+            context.font = "Bold " + fontsize + "px " + fontface;
+            context.fillStyle = "#00ffff"; 
+            context.textAlign = 'center';
+            context.textBaseline = 'middle';
+            context.fillText(message, canvas.width / 2, canvas.height / 2);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: texture, depthTest: false }); 
+            const sprite = new THREE.Sprite(mat);
+            sprite.scale.set(400, 200, 1); 
+            return sprite;
+        }
+
+        function calculateNextCoords(currGX, currGY, currSX, currSY, dx, dy) {
+            let nextGX = currGX, nextGY = currGY, nextSX = currSX, nextSY = currSY;
+            if (dx !== 0) {
+                let tempSX = currSX + dx;
+                if (tempSX > 1) { nextGX++; nextSX = 0; }
+                else if (tempSX < 0) { nextGX--; nextSX = 1; }
+                else { nextSX = tempSX; }
+            }
+            if (dy !== 0) {
+                let tempSY = currSY + dy;
+                if (tempSY > 1) { nextGY++; nextSY = 0; }
+                else if (tempSY < 0) { nextGY--; nextSY = 1; }
+                else { nextSY = tempSY; }
+            }
+            return { gX: nextGX, gY: nextGY, sX: nextSX, sY: nextSY };
+        }
+        async function checkNeighborExists(dx, dy) {
+            const next = calculateNextCoords(state.gX, state.gY, state.sX, state.sY, dx, dy);
+            const url = `${TILE_FOLDER}${getFilename(next.gX, next.gY, next.sX, next.sY)}.tif`;
+            try { const r = await fetch(url, { method: 'HEAD' }); return r.ok; } catch (e) { return false; }
+        }
+        function moveTile(dx, dy) {
+            state = calculateNextCoords(state.gX, state.gY, state.sX, state.sY, dx, dy);
+            updateWorld();
+        }
+        function getFilename(gx, gy, sx, sy) {
+            return `${PREFIX}${gx}${gy}${(sy === 1) ? 'n' : 's'}${(sx === 1) ? 'e' : 'w'}${SUFFIX}`;
+        }
+        function centerCamera() {
+            controls.target.set(0,0,0);
+            camera.position.set(0, 4000, 4000);
+            controls.update();
+        }
+        function updateStatus(txt, isWarning) {
+            const el = document.getElementById('status'); el.innerText = txt; el.className = isWarning ? 'loading' : '';
+        }
+        function disableInterface(disabled) {
+            document.querySelectorAll('button').forEach(b => { if(disabled) b.disabled = true; });
+        }
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+        function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+    </script>
+</body>
+</html>
