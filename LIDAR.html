@@ -69,24 +69,19 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { fromUrl } from 'geotiff';
 
-        // --- KONFIGURACJA ---
         const TILE_FOLDER = './tiles/'; 
         const PREFIX = "TR";
         const SUFFIX = "_DTM_1m"; 
 
-        // Start (TR 34 dla Dover)
         let state = { gX: 2, gY: 6, sX: 0, sY: 1 };
 
-        // --- PARAMETRY ---
         const COLOR_MAX_HEIGHT = 150; 
         const HEIGHT_MULTIPLIER = 5.0; 
         const MAP_SIZE = 6000;          
         
-        // --- USTAWIENIA POZIOMIC ---
         const CONTOUR_INTERVAL = 50;  
         const CONTOUR_OFFSET = 1.0;   
 
-        // CZYSTOŚĆ ETYKIET NA MAPIE
         const LABEL_FREQUENCY = 800; 
 
         let scene, camera, renderer, controls, terrainMesh;
@@ -174,7 +169,6 @@
         function processTerrain(data, width, height) {
             if (terrainMesh) { scene.remove(terrainMesh); terrainMesh.geometry.dispose(); terrainMesh.material.dispose(); }
 
-            // 1. Max wysokość
             let trueMax = -Infinity;
             for(let i=0; i<data.length; i+=2) {
                 const val = data[i];
@@ -183,7 +177,6 @@
             if (trueMax === -Infinity) trueMax = 0;
             document.getElementById('debug-max').innerText = trueMax.toFixed(1) + " m";
 
-            // 2. Siatka 3D
             const maxDim = 1024;
             const skip = Math.ceil(Math.max(width, height) / maxDim);
             const newW = Math.floor(width / skip);
@@ -239,19 +232,14 @@
             createRulers(trueMax);
         }
 
-        // --- LINIJKI W ROGACH ---
         function createRulers(maxRealH) {
             if (axisGroup) { scene.remove(axisGroup); }
             axisGroup = new THREE.Group();
 
             const halfSize = MAP_SIZE / 2;
-            
-            // --- ZMIANA: WYMUSZAMY MINIMUM 200 METRÓW ---
-            // Najpierw obliczamy ile by wychodziło z terenu (zaokrąglone do 50)
+        
             let calculatedLimit = Math.ceil(maxRealH / CONTOUR_INTERVAL) * CONTOUR_INTERVAL;
             
-            // Potem wymuszamy, że jeśli calculatedLimit jest mniejsze niż 200, to bierzemy 200.
-            // Jeśli teren ma 300m, to weźmie 300m.
             let rulerLimit = Math.max(calculatedLimit, 200);
 
             const corners = [
@@ -292,7 +280,6 @@
             scene.add(axisGroup);
         }
 
-        // --- MARCHING SQUARES ---
         function createMarchingSquaresContours(grid, w, h, maxH) {
             if (contoursGroup) { scene.remove(contoursGroup); }
             contoursGroup = new THREE.Group();
@@ -430,3 +417,4 @@
     </script>
 </body>
 </html>
+
